@@ -88,7 +88,7 @@ class TestUpdateWeight(unittest.TestCase):
                 ),
                 ignore_idx=-100,
                 use_kl_loss=False,
-                kl_loss_coef=0.001, 
+                kl_loss_coef=0.001,
                 kl_loss_type="low_var_kl",
                 mode="eager"),
             lr_cfg=lr_cfg,
@@ -124,12 +124,12 @@ class TestUpdateWeight(unittest.TestCase):
         rollout_controller = self.rollout_cfg.build(self.pg)
 
         input_state = RolloutState(message=TEST_TEXT_MESSAGES, sample_params=sample_params)
-        res_baseline = ray.get(rollout_controller.generate.remote(rollout_state=input_state)) 
-        
+        res_baseline = ray.get(rollout_controller.generate.remote(rollout_state=input_state))
+
         # start update weight test
         info_dict = ray.get(rollout_controller.get_rollout_metadata.remote())
         train_controller.update_rollout_info(info_dict, train_rollout_mode="colocate")
-        
+
         # update weights
         ray.get(rollout_controller.offload.remote())
         train_controller.onload(target="all")
@@ -139,11 +139,11 @@ class TestUpdateWeight(unittest.TestCase):
         train_controller.offload("model")
         ray.get(rollout_controller.onload_kvcache.remote())
 
-        res_update_weight = ray.get(rollout_controller.generate.remote(rollout_state=input_state)) 
+        res_update_weight = ray.get(rollout_controller.generate.remote(rollout_state=input_state))
         self.assertEqual(res_update_weight.response, res_baseline.response)
         ray.get(rollout_controller.shutdown.remote(), timeout=60)
 
-    def _check_sglang_weights(self, rollout_controller, action):
+    def _check_rollout_weights(self, rollout_controller, action):
         info_dict = ray.get(rollout_controller.get_rollout_metadata.remote())
         active_urls = [
             url
@@ -165,7 +165,7 @@ class TestUpdateWeight(unittest.TestCase):
     def _run_sglang_update_weight_equal_after_reset(self):
 
         # This test verifies SGLang rollout weight update correctness with a parameter-only check.
-        # The SGLang parameter-only WeightChecker actions are implemented in 
+        # The SGLang parameter-only WeightChecker actions are implemented in
         # https://github.com/PengchengShi00/sglang/commit/05e89d63b5a1a80671b267ff4494ad950b2aba75.
         # Flow: snapshot_parameters -> reset_parameters -> update_weights -> compare_parameters.
         TrainingWorker = ray.remote(
@@ -190,8 +190,8 @@ class TestUpdateWeight(unittest.TestCase):
         rollout_controller = self.rollout_cfg.build(self.pg)
 
         try:
-            self._check_sglang_weights(rollout_controller, action="snapshot_parameters")
-            self._check_sglang_weights(rollout_controller, action="reset_parameters")
+            self._check_rollout_weights(rollout_controller, action="snapshot_parameters")
+            self._check_rollout_weights(rollout_controller, action="reset_parameters")
 
             info_dict = ray.get(rollout_controller.get_rollout_metadata.remote())
             train_controller.update_rollout_info(info_dict, train_rollout_mode="colocate")
@@ -203,13 +203,60 @@ class TestUpdateWeight(unittest.TestCase):
             train_controller.update_weights()
             train_controller.offload("model")
 
-            self._check_sglang_weights(rollout_controller, action="compare_parameters")
+            self._check_rollout_weights(rollout_controller, action="compare_parameters")
+        finally:
+            ray.get(rollout_controller.shutdown.remote(), timeout=60)
+
+    def _run_lmdeploy_update_weight_equal_after_reset(self):
+        TrainingWorker = ray.remote(
+            runtime_env={
+                "env_vars": {
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                    "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                }
+            },
+        )(BaseTrainingWorker)
+        train_workers, _ = AutoAcceleratorWorkers.from_placement_group(
+            TrainingWorker, self.worker_cfg, self.pg
+        )
+        futures = [worker.test_all_reduce.remote() for worker in train_workers]
+        ray.get(futures)
+        train_controller = TrainingController(
+            workers=train_workers,
+        )
+
+        self.rollout_cfg.skip_load_weights = False
+        self.rollout_cfg.extra_rollout_config = {
+            "lmdeploy_backend": "pytorch",
+            "lmdeploy_distributed_executor_backend": "ray",
+        }
+        rollout_controller = self.rollout_cfg.build(self.pg)
+
+        try:
+            self._check_rollout_weights(rollout_controller, action="snapshot_parameters")
+            self._check_rollout_weights(rollout_controller, action="reset_parameters")
+
+            info_dict = ray.get(rollout_controller.get_rollout_metadata.remote())
+            train_controller.update_rollout_info(info_dict, train_rollout_mode="colocate")
+
+            ray.get(rollout_controller.offload.remote())
+            train_controller.onload(target="all")
+            train_controller.offload("optimizer")
+            ray.get(rollout_controller.onload_weights.remote())
+            train_controller.update_weights()
+            train_controller.offload("model")
+
+            self._check_rollout_weights(rollout_controller, action="compare_parameters")
         finally:
             ray.get(rollout_controller.shutdown.remote(), timeout=60)
 
     @unittest.skipIf(os.environ.get("XTUNER_USE_LMDEPLOY", "0") == "0", "lmdeploy backend is not enabled")
     def test_lmdeploy_update_weight_and_generate(self):
         self._run_colocate_update_weight_and_generate()
+
+    @unittest.skipIf(os.environ.get("XTUNER_USE_LMDEPLOY", "0") == "0", "lmdeploy backend is not enabled")
+    def test_lmdeploy_update_weight_equal_after_reset(self):
+        self._run_lmdeploy_update_weight_equal_after_reset()
 
     @unittest.skipIf(os.environ.get("XTUNER_USE_SGLANG", "0") == "0", "sglang backend is not enabled")
     def test_sglang_update_weight_and_generate(self):

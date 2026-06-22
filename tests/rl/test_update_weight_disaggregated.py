@@ -117,7 +117,7 @@ class TestUpdateWeightDisaggregated(unittest.TestCase):
             pack_max_length=1024,
         )
 
-    def _check_sglang_weights(self, rollout_controller, action):
+    def _check_rollout_weights(self, rollout_controller, action):
         info_dict = ray.get(rollout_controller.get_rollout_metadata.remote())
         active_urls = [
             url
@@ -151,7 +151,7 @@ class TestUpdateWeightDisaggregated(unittest.TestCase):
         )
         ray.get([worker.test_all_reduce.remote() for worker in train_workers])
         train_controller = TrainingController(workers=train_workers)
-        
+
         self.rollout_cfg.skip_load_weights = False
         rollout_controller = self.rollout_cfg.build(self.rollout_pg)
 
@@ -170,7 +170,7 @@ class TestUpdateWeightDisaggregated(unittest.TestCase):
     @unittest.skipIf(os.environ.get("XTUNER_USE_SGLANG", "0") == "0", "sglang backend is not enabled")
     def test_sglang_disaggregated_update_weight_equal_after_reset(self):
         # This test verifies SGLang rollout weight update correctness with a parameter-only check.
-        # The SGLang parameter-only WeightChecker actions are implemented in 
+        # The SGLang parameter-only WeightChecker actions are implemented in
         # https://github.com/PengchengShi00/sglang/commit/05e89d63b5a1a80671b267ff4494ad950b2aba75.
         # Flow: snapshot_parameters -> reset_parameters -> update_weights -> compare_parameters.
         TrainingWorker = ray.remote(
@@ -191,14 +191,14 @@ class TestUpdateWeightDisaggregated(unittest.TestCase):
         rollout_controller = self.rollout_cfg.build(self.rollout_pg)
 
         try:
-            self._check_sglang_weights(rollout_controller, action="snapshot_parameters")
-            self._check_sglang_weights(rollout_controller, action="reset_parameters")
+            self._check_rollout_weights(rollout_controller, action="snapshot_parameters")
+            self._check_rollout_weights(rollout_controller, action="reset_parameters")
 
             info_dict = ray.get(rollout_controller.get_rollout_metadata.remote())
             train_controller.update_rollout_info(info_dict, train_rollout_mode="disaggregated")
             train_controller.update_weights()
 
-            self._check_sglang_weights(rollout_controller, action="compare_parameters")
+            self._check_rollout_weights(rollout_controller, action="compare_parameters")
         finally:
             ray.get(rollout_controller.shutdown.remote(), timeout=60)
 
@@ -239,6 +239,44 @@ class TestUpdateWeightDisaggregated(unittest.TestCase):
         res_update_weight = ray.get(rollout_controller.generate.remote(rollout_state=input_state))
         self.assertEqual(res_update_weight.response, res_baseline.response)
         ray.get(rollout_controller.shutdown.remote(), timeout=60)
+
+    @unittest.skipIf(
+        os.environ.get("XTUNER_USE_LMDEPLOY", "0") == "0",
+        "lmdeploy backend is not enabled",
+    )
+    def test_lmdeploy_disaggregated_update_weight_equal_after_reset(self):
+        TrainingWorker = ray.remote(
+            runtime_env={
+                "env_vars": {
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                    "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                }
+            },
+        )(BaseTrainingWorker)
+        train_workers, _ = AutoAcceleratorWorkers.from_placement_group(
+            TrainingWorker, self.worker_cfg, self.train_pg
+        )
+        ray.get([worker.test_all_reduce.remote() for worker in train_workers])
+        train_controller = TrainingController(workers=train_workers)
+
+        self.rollout_cfg.skip_load_weights = False
+        self.rollout_cfg.extra_rollout_config = {
+            "lmdeploy_backend": "pytorch",
+            "lmdeploy_distributed_executor_backend": "ray",
+        }
+        rollout_controller = self.rollout_cfg.build(self.rollout_pg)
+
+        try:
+            self._check_rollout_weights(rollout_controller, action="snapshot_parameters")
+            self._check_rollout_weights(rollout_controller, action="reset_parameters")
+
+            info_dict = ray.get(rollout_controller.get_rollout_metadata.remote())
+            train_controller.update_rollout_info(info_dict, train_rollout_mode="disaggregated")
+            train_controller.update_weights()
+
+            self._check_rollout_weights(rollout_controller, action="compare_parameters")
+        finally:
+            ray.get(rollout_controller.shutdown.remote(), timeout=60)
 
 if __name__ == "__main__":
     unittest.main()
